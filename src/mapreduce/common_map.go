@@ -1,8 +1,10 @@
 package mapreduce
 
 import (
+	"bufio"
 	"encoding/json"
 	"hash/fnv"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -71,20 +73,32 @@ func doMap(
 	kvs := mapF(inFile, string(bytes))
 	m := make(map[string][]int)
 	for i, kv := range kvs {
-		// _, ok := m[kv.Key]
-		// if !ok {
-		// m[kv.Key] = make([]int, 1)
-		// }
 		m[kv.Key] = append(m[kv.Key], i)
 	}
-	for k, values := range m {
-		r := ihash(k) % nReduce
-		// TODO open file only once
-		name := reduceName(jobName, mapTaskNumber, r)
+	var files []*os.File
+	var writers []io.Writer
+
+	for i := 0; i < nReduce; i++ {
+		name := reduceName(jobName, mapTaskNumber, i)
 		f, err := os.OpenFile(name, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0755)
 		if err != nil {
 			log.Fatal(err)
 		}
+		files = append(files, f)
+		w := bufio.NewWriter(f)
+		writers = append(writers, w)
+	}
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+	}()
+
+	for k, values := range m {
+		r := ihash(k) % nReduce
+		f := files[r]
+		// f := writers[r]
+		// TODO open file only once
 		enc := json.NewEncoder(f)
 		for _, i := range values {
 			err := enc.Encode(&kvs[i])
@@ -92,7 +106,6 @@ func doMap(
 				log.Fatal(err)
 			}
 		}
-		f.Close()
 
 	}
 

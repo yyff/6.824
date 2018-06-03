@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	// "sort"
 )
 
 // doReduce manages one reduce task: it reads the intermediate
@@ -83,9 +84,19 @@ func doReduce(
 		f.Close()
 
 	}
+	// keys := make([]string, 0, len(kvalues))
+	// for key, _ := range kvalues {
+	// keys = append(keys, key)
+	// }
+	// sort.Strings(keys)
 
 	for key, values := range kvalues {
-		enc.Encode(KeyValue{key, reduceF(key, values)})
+		// for _, key := range keys {
+		// values := kvalues[key]
+		err = enc.Encode(KeyValue{key, reduceF(key, values)})
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 }

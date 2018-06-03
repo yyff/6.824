@@ -19,16 +19,30 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// TODO: you have to write this function
 	var words []mapreduce.KeyValue
 
-	pre := 0
-	for i, ch := range contents {
-		if !unicode.IsLetter(ch) {
-			if pre != i {
-				word := contents[pre:i]
+	i := 0
+	j := 0
+	for j < len(contents) {
+		if unicode.IsLetter(rune(contents[j])) {
+			j++
+		} else {
+			if i != j {
+				word := contents[i:j]
 				words = append(words, mapreduce.KeyValue{word, ""})
 			}
-			pre = i + 1
+			j++
+			i = j
 		}
 	}
+	// pre := 0
+	// for i, ch := range contents {
+	// if !unicode.IsLetter(ch) {
+	// if pre != i {
+	// word := contents[pre:i]
+	// words = append(words, mapreduce.KeyValue{word, ""})
+	// }
+	// pre = i + 1
+	// }
+	// }
 	return words
 }
 
