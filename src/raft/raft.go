@@ -17,8 +17,11 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "encoding/gob"
@@ -55,18 +58,24 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// persistent state
+	// should be stored in persister and recover it when restart
 	currentTerm int
 	voteFor     int
 	logs        []*Entry
 
 	// volatile state
-	// isLeader    bool
-	role        int
+	// for all servers
+	isLeader    bool
 	commitIndex int
 	lastApplied int
 
+	// for leader
 	matchIndex []int
 	nextIndex  []int
+}
+type Entry struct {
+	Term    int
+	Command string
 }
 
 // return currentTerm and whether this server
@@ -76,6 +85,11 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	// todo: use persister
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.isLeader
 	return term, isleader
 }
 
@@ -110,6 +124,14 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+type AppendEntriesArgs struct{}
+type AppendEntriesReply struct{}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	return
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -137,6 +159,24 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	if args.Term < rf.currentTerm {
+		return
+	}
+	lastLogIndex := len(rf.logs) - 1
+	lastLogTerm := rf.logs[lastLogIndex].Term
+	// todo: use candidateId
+	if rf.voteFor == -1 ||
+		args.LastLogTerm > lastLogTerm || // if candidate's log is up-to-date
+		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+		reply.VoteGranted = true
+		rf.mu.Lock()
+		rf.currentTerm = args.Term
+		rf.mu.Unlock()
+	}
+	return
 }
 
 //
@@ -170,6 +210,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -225,10 +270,41 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.voteFor = -1
+	rf.logs = make([]*Entry, 0)
+
+	rf.isLeader = false
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.matchIndex = make([]int, len(peers))
+	rf.nextIndex = make([]int, len(peers))
+	for i := 0; i < len(peers); i++ {
+		rf.matchIndex[i] = 0
+		rf.nextIndex[i] = len(rf.logs)
+	}
+
 	go func() {
 		for {
-			// if timeout of heartbeat
-			// do request vote
+			// if timeout of ticker, do request vote
+			// 1. timeout should be greater than multi times of heartbeat period, think about 150 * 2 = 300
+		}
+
+	}()
+
+	go func() {
+		// send heartbeat periodly
+		tick := time.NewTicker(150 * time.Millisecond)
+		for {
+			select {
+			case <-tick.C:
+				for i, _ := range rf.peers {
+					if i != me {
+						rf.sendAppendEntries(i, nil, nil)
+					}
+				}
+			}
+
 		}
 
 	}()
