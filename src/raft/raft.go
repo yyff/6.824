@@ -78,12 +78,16 @@ type Raft struct {
 
 	// other
 	// resetTickCh     chan struct{}
-	receiveAppendCh chan struct{}
+	receiveCh chan struct{}
 }
 
 type Entry struct {
 	Term    int
 	Command string
+}
+
+func (rf *Raft) updateReceiveCh() {
+	rf.receiveCh <- struct{}{}
 }
 
 // return currentTerm and whether this server
@@ -147,47 +151,49 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	log.Printf("[%+v] receive AppendEntries from [%+v], args: %+v, reply: %+v", rf.me, args.LeaderId, args, reply)
-	reply.Term = args.Term
+	defer log.Printf("[%+v] receive AppendEntries from [%+v], args: %+v, reply: %+v", rf.me, args.LeaderId, args, reply)
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
 	reply.Success = true
-	rf.mu.Lock()
-	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
-	if args.Term < currentTerm {
-		reply.Term = currentTerm
+	if args.Term < rf.currentTerm {
 		reply.Success = false
-		return
 	}
-	// if args.Term >= currentTerm {
-	rf.mu.Lock()
+	// rf.mu.Lock()
 	if args.PrevLogIndex >= len(rf.logs) {
 		reply.Success = false
 	} else if args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 	}
-
-	if reply.Success == true {
-		if args.PrevLogIndex >= -1 { // at least one entry
-			curLogIndex := args.PrevLogIndex + 1
-			if curLogIndex == 0 {
-				rf.logs = make([]*Entry, 0)
-			} else {
-				rf.logs = rf.logs[0:curLogIndex]
-			}
-			for _, entry := range args.logs {
-				rf.logs = append(rf.logs, entry)
-				// rf.logs = append(rf.logs, entry)
-			}
-
-		}
+	if reply.Success == false {
+		return
 	}
+
+	// if reply.Success == true {
+	if args.PrevLogIndex >= -1 { // at least one entry
+		curLogIndex := args.PrevLogIndex + 1
+		if curLogIndex == 0 {
+			rf.logs = make([]*Entry, 0)
+		} else {
+			rf.logs = rf.logs[0:curLogIndex]
+		}
+		for _, entry := range args.logs {
+			rf.logs = append(rf.logs, entry)
+			// rf.logs = append(rf.logs, entry)
+		}
+
+	}
+	// }
 	rf.commitIndex = args.leaderCommit
 	if len(rf.logs)-1 < args.leaderCommit {
 		rf.commitIndex = len(rf.logs) - 1
 	}
 
-	rf.currentTerm = args.Term
-	rf.voteFor = args.LeaderId
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term // update term and voteFor
+		rf.voteFor = -1
+	}
+	rf.isLeader = false
+	// rf.voteFor = args.LeaderId
 	// for _, entry := range args.logs {
 	// rf.logs = append(rf.logs, entry)
 	// }
@@ -196,11 +202,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// }
 
 	// if success
-	go func() {
-		// rf.resetTickCh <- struct{}{}
-		rf.receiveAppendCh <- struct{}{}
+	go rf.updateReceiveCh()
+	// go func() {
+	// // rf.resetTickCh <- struct{}{}
+	// rf.receiveCh <- struct{}{}
 
-	}()
+	// }()
 	// if term > currentterm, update
 }
 
@@ -231,32 +238,37 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	log.Printf("[%v] receive RequestVote from [%+v], raft: %+v, args: %+v, reply: %+v", rf.me, args.Candidate, rf, args, reply)
+	defer log.Printf("[%v] receive RequestVote from [%+v], raft: %+v, args: %+v, reply: %+v", rf.me, args.Candidate, rf, args, reply)
 	rf.mu.Lock()
-	currentTerm := rf.currentTerm
-
-	reply.Term = currentTerm
+	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	if args.Term <= currentTerm {
+	if args.Term < rf.currentTerm {
 		rf.mu.Unlock()
 		return
 	}
+	// currentTerm := rf.currentTerm
 	lastLogIndex := len(rf.logs) - 1
 	lastLogTerm := 0
 	if lastLogIndex >= 0 {
 		lastLogTerm = rf.logs[lastLogIndex].Term
 	}
 	// todo: use candidateId
-	if rf.voteFor == -1 || // todo: wrong
+	voteGranted := false
+	if args.Term > rf.currentTerm {
+		voteGranted = true
+	} else if rf.voteFor == -1 && // not vote in currentterm
 		(args.LastLogTerm > lastLogTerm || // if candidate's log is up-to-date
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
+		voteGranted = true
 		// if args.Term > rf.currentTerm {
-
+		// }
+	}
+	if voteGranted {
 		reply.VoteGranted = true
 		rf.currentTerm = args.Term
 		rf.voteFor = args.Candidate
 		rf.isLeader = false
-		// }
+		go rf.updateReceiveCh()
 	}
 	rf.mu.Unlock()
 	return
@@ -352,7 +364,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	// rf.resetTickCh = make(chan struct{})
-	rf.receiveAppendCh = make(chan struct{})
+	rf.receiveCh = make(chan struct{})
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
@@ -411,6 +423,11 @@ func heartbeatLoop(rf *Raft) {
 				go func(index int) {
 					reply := &AppendEntriesReply{}
 					rf.sendAppendEntries(index, args, reply)
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+					}
+					rf.mu.Unlock()
 					log.Printf("[%+v] send heartbeat to [%+v], args: %+v, reply: %+v", rf.me, index, args, reply)
 				}(i)
 			}
@@ -427,7 +444,7 @@ func electionLoop(rf *Raft) {
 		// 1. timeout should be greater than multi times of heartbeat period, think about 150 * 2 = 300
 		// 2. election timeout: (1) no append request  (2) during election
 		select {
-		case <-rf.receiveAppendCh: // receive append
+		case <-rf.receiveCh: // receive append
 			ticker = getNewTicker() // todo: confirm whether it's problem if don't release old ticker
 			continue
 		case <-ticker.C:
@@ -453,7 +470,8 @@ func electionLoop(rf *Raft) {
 			}
 
 			rf.mu.Unlock()
-			voteChan := make(chan bool)
+			// voteChan := make(chan bool)
+			voteChan := make(chan *RequestVoteReply)
 			for i, _ := range rf.peers {
 				if i == rf.me {
 					continue
@@ -463,51 +481,114 @@ func electionLoop(rf *Raft) {
 					// votes++
 					// }
 					reply := &RequestVoteReply{}
-					if ok := rf.sendRequestVote(index, args, reply); !ok {
-						voteChan <- false
-					} else {
-						voteChan <- reply.VoteGranted
-					}
+					// if ok := rf.sendRequestVote(index, args, reply); !ok {
+					// voteChan <- false
+					// } else {
+					// voteChan <- reply.VoteGranted
+					// }
+					rf.sendRequestVote(index, args, reply)
+					voteChan <- reply
 					log.Printf("[%+v] sendRequestVote to [%+v], args: %+v, reply: %+v", rf.me, index, args, reply)
 
 				}(i)
 			}
 
+			finalVote := make(chan bool)
+			go func() { // count votes and update
+				votes := 1
+				total := 1
+				electionOver := false
+				electionSuccess := false
+				for {
+					select {
+					case reply := <-voteChan:
+						rf.mu.Lock()
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.voteFor = -1
+							electionOver = true
+							rf.mu.Unlock()
+							break
+						}
+						if reply.VoteGranted {
+							votes++
+							if votes > len(rf.peers)/2 {
+								electionOver = true
+								electionSuccess = true
+							}
+						}
+						rf.mu.Unlock()
+						total++
+					}
+					if total == len(rf.peers) || electionOver {
+						break
+					}
+
+				}
+				// close(voteChan)
+				finalVote <- electionSuccess
+
+			}()
+
 			// timeout = rand.Intn(150) + 300
 			// tick = time.NewTicker(time.Duration(timeout) * time.Millisecond)
 			ticker = getNewTicker() // todo: maybe placed more upward
 
-			votes := 1
-			total := 1
-			for {
-				select {
-				case <-rf.receiveAppendCh:
-					break
-				case <-ticker.C: // election timeout
-					break
-				case isGrant := <-voteChan:
-					if isGrant {
-						votes++
-						if votes > len(rf.peers)/2 { // votes num >= majority, become leader
-							log.Printf("server [%+v] become leader", rf.me)
-							rf.mu.Lock()
-							rf.isLeader = true
-							for i := 0; i < len(rf.matchIndex); i++ {
-								rf.matchIndex[i] = 0
-								rf.nextIndex[i] = len(rf.logs)
-							}
-
-							rf.mu.Unlock()
-						}
-						break
+			// votes := 1
+			// total := 1
+			// electionOver := false
+			// for { // todo: replace this loop
+			select {
+			case <-rf.receiveCh:
+				// electionOver = true
+				break
+			case <-ticker.C: // election timeout
+				// electionOver = true
+				break
+			case succ := <-finalVote:
+				if succ {
+					rf.mu.Lock()
+					log.Printf("server [%+v] become leader", rf.me)
+					rf.isLeader = true
+					for i := 0; i < len(rf.matchIndex); i++ {
+						rf.matchIndex[i] = 0
+						rf.nextIndex[i] = len(rf.logs)
 					}
-					total++
-					if total == len(rf.peers) { // all request done
-						break
-					}
+					rf.mu.Unlock()
 				}
-
+				break
 			}
+
+			// case reply := <-voteChan:
+
+			// if reply.VoteGranted {
+			// votes++
+			// if votes > len(rf.peers)/2 { // votes num >= majority, become leader
+			// log.Printf("server [%+v] become leader", rf.me)
+			// rf.mu.Lock()
+			// rf.isLeader = true
+			// for i := 0; i < len(rf.matchIndex); i++ {
+			// rf.matchIndex[i] = 0
+			// rf.nextIndex[i] = len(rf.logs)
+			// }
+
+			// rf.mu.Unlock()
+			// elecitonOver = true
+			// }
+			// break
+			// }
+			// total++
+			// if total == len(rf.peers) { // all request done
+			// elecitonOver = true
+			// break
+			// }
+			// }
+			// if electionOver {
+			// close(voteChan)
+			// break
+			// }
+
+			// }
 			ticker = getNewTicker()
 
 		}
@@ -517,7 +598,7 @@ func electionLoop(rf *Raft) {
 // election ticker
 func getNewTicker() *time.Ticker {
 	rand := rand.New(rand.NewSource(time.Now().Unix()))
-	timeout := rand.Intn(150) + 300
+	timeout := rand.Intn(200) + 300
 	tick := time.NewTicker(time.Duration(timeout) * time.Millisecond)
 	return tick
 }
