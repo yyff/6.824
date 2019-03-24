@@ -155,9 +155,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term      int
-	Success   bool
-	NextIndex int
+	Term                     int
+	Success                  bool
+	ConflictTerm             int
+	FirstIndexOfConflictTerm int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -168,9 +169,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	if args.Term < rf.currentTerm {
 		reply.Success = false
-		if args.PrevLogIndex >= len(rf.logs) {
-			reply.NextIndex = len(rf.logs)
-		}
 		// log.Printf("server[%+v] deny AppendEntries from [%+v], args: %+v, reply: %+v, raft: %+v", rf.me, args.LeaderId, args, reply, rf)
 		// rf.mu.Unlock()
 		return
@@ -194,9 +192,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if reply.Success == false {
 		log.Printf("server[%+v] deny AppendEntries from [%+v], args: %+v, rf: %s", rf.me, args.LeaderId, args, rf)
 		// rf.mu.Unlock()
-		if args.PrevLogIndex >= len(rf.logs) {
-			reply.NextIndex = len(rf.logs)
+		if args.PrevLogIndex > len(rf.logs)-1 {
+			reply.ConflictTerm = rf.logs[len(rf.logs)-1].Term
+		} else {
+			reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
 		}
+		tIndex := args.PrevLogIndex
+		if len(rf.logs) > 1 {
+			if tIndex > len(rf.logs)-1 {
+				tIndex = len(rf.logs) - 1
+			}
+			for ; rf.logs[tIndex-1].Term == reply.ConflictTerm; tIndex-- {
+			}
+		} else {
+			tIndex = 1
+		}
+		reply.FirstIndexOfConflictTerm = tIndex
+		log.Printf("server[%+v] deny AppendEntries, reply: %v", rf.me, reply)
+
 		if isUpdatePersist {
 			rf.persist()
 		}
@@ -643,16 +656,35 @@ func sendAppendLoop(rf *Raft) { // should merge the heartbeatloop
 
 						} else { // still leader, decrease next log index
 							if args.PrevLogIndex > 0 && rf.currentTerm == args.Term {
+								if reply.ConflictTerm > args.PrevLogTerm {
+									rf.nextIndex[server] = reply.FirstIndexOfConflictTerm
+								} else if reply.ConflictTerm == 0 {
+									rf.nextIndex[server] = 1 // because can't distinguish which situation make reply.ConflictTerm 0: 1. request failed; 2. requested server have no logs
+								} else { //
+									findIndex := -1
+									for i := args.PrevLogIndex; i > 0; i-- { // find last log index of conflict term
+										if rf.logs[i].Term == reply.ConflictTerm {
+											findIndex = i
+											break
+										}
+									}
+									if findIndex == -1 {
+										rf.nextIndex[server] = reply.FirstIndexOfConflictTerm
+									} else {
+										rf.nextIndex[server] = findIndex
+
+									}
+								}
 								// nextIndex - 1 if failed
-								rf.nextIndex[server] = args.PrevLogIndex
-								log.Printf("leader[%v] decrease nextIndex[%v] to %v", rf.me, server, args.PrevLogIndex)
+								// rf.nextIndex[server] = args.PrevLogIndex
+								log.Printf("leader[%v] decrease server[%v]'s nextIndex to %v, reply: %v", rf.me, server, rf.nextIndex[server], reply)
 							}
 						}
 
-						if reply.NextIndex != 0 {
-							rf.nextIndex[server] = reply.NextIndex
-							log.Printf("leader[%v] decrease nextIndex[%v] to %v from reply", rf.me, server, reply.NextIndex)
-						}
+						// if reply.NextIndex != 0 {
+						// rf.nextIndex[server] = reply.NextIndex
+						// log.Printf("leader[%v] decrease nextIndex[%v] to %v from reply", rf.me, server, reply.NextIndex)
+						// }
 						rf.mu.Unlock()
 						return
 					}
